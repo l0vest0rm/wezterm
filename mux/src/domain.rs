@@ -496,19 +496,31 @@ impl LocalDomain {
 #[derive(Clone)]
 pub(crate) struct WriterWrapper {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    pane_id: Arc<Mutex<Option<crate::pane::PaneId>>>,
 }
 
 impl WriterWrapper {
     pub fn new(writer: Box<dyn Write + Send>) -> Self {
         Self {
             writer: Arc::new(Mutex::new(writer)),
+            pane_id: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn bind_pane_id(&self, pane_id: crate::pane::PaneId) {
+        self.pane_id.lock().replace(pane_id);
     }
 }
 
 impl std::io::Write for WriterWrapper {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.writer.lock().write(buf)
+        let size = self.writer.lock().write(buf)?;
+        if let Some(pane_id) = *self.pane_id.lock() {
+            if let Some(mux) = crate::Mux::try_get() {
+                mux.record_session_input_bytes(pane_id, &buf[..size]);
+            }
+        }
+        Ok(size)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -617,6 +629,7 @@ impl Domain for LocalDomain {
         );
         let child_result = pair.slave.spawn_command(cmd);
         let mut writer = WriterWrapper::new(pair.master.take_writer()?);
+        writer.bind_pane_id(pane_id);
 
         let mut terminal = wezterm_term::Terminal::new(
             size,
@@ -657,7 +670,6 @@ impl Domain for LocalDomain {
                 ))
             }
         };
-
         let mux = Mux::get();
         mux.add_pane(&pane)?;
 

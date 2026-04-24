@@ -2003,6 +2003,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Shell"],
             icon: None,
         },
+        PromptForSessionAugmentedInput => CommandDef {
+            brief: "Prompt for augmented input".into(),
+            doc: "Collect context from the active pane, record it, and paste an augmented prompt".into(),
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "r".into())],
+            args: &[ArgType::ActivePane],
+            menubar: &["Edit"],
+            icon: Some("oct_repo_pull"),
+        },
         ActivateCommandPalette => CommandDef {
             brief: "Activate Command Palette".into(),
             doc: "Shows the command palette modal".into(),

@@ -40,6 +40,7 @@ pub mod domain;
 pub mod localpane;
 pub mod pane;
 pub mod renderable;
+mod sessionrecorder;
 pub mod ssh;
 pub mod ssh_agent;
 pub mod tab;
@@ -50,6 +51,7 @@ mod tmux_pty;
 pub mod window;
 
 use crate::activity::Activity;
+use crate::sessionrecorder::{SessionMetadata, SessionRecorder};
 
 pub const DEFAULT_WORKSPACE: &str = "default";
 
@@ -113,6 +115,7 @@ pub struct Mux {
     num_panes_by_workspace: RwLock<HashMap<String, usize>>,
     main_thread_id: std::thread::ThreadId,
     agent: Option<AgentProxy>,
+    session_recorder: SessionRecorder,
 }
 
 const BUFSIZE: usize = 1024 * 1024;
@@ -329,6 +332,9 @@ fn read_from_pane_pty(
             Ok(size) => {
                 histogram!("read_from_pane_pty.bytes.rate").record(size as f64);
                 log::trace!("read_pty pane {pane_id} read {size} bytes");
+                if let Some(mux) = Mux::try_get() {
+                    mux.record_session_output_bytes(pane_id, &buf[..size]);
+                }
                 if let Err(err) = tx.write_all(&buf[..size]) {
                     error!(
                         "read_pty failed to write to parser: pane {} {:?}",
@@ -448,6 +454,7 @@ impl Mux {
             num_panes_by_workspace: RwLock::new(HashMap::new()),
             main_thread_id: std::thread::current().id(),
             agent,
+            session_recorder: SessionRecorder::new(),
         }
     }
 
@@ -494,6 +501,18 @@ impl Mux {
         if let Some(ident) = self.identity.read().as_ref() {
             self.client_had_input(ident);
         }
+    }
+
+    pub fn record_session_input_bytes(&self, pane_id: PaneId, bytes: &[u8]) {
+        self.session_recorder.record_input_bytes(pane_id, bytes);
+    }
+
+    pub fn record_session_output_bytes(&self, pane_id: PaneId, bytes: &[u8]) {
+        self.session_recorder.record_output_bytes(pane_id, bytes);
+    }
+
+    pub fn record_session_text_event(&self, pane_id: PaneId, event_type: &str, text: &str) {
+        self.session_recorder.record_text_event(pane_id, event_type, text);
     }
 
     pub fn record_focus_for_current_identity(&self, pane_id: PaneId) {
@@ -786,6 +805,21 @@ impl Mux {
 
         self.panes.write().insert(pane.pane_id(), Arc::clone(pane));
         let pane_id = pane.pane_id();
+        let resolved = self.resolve_pane_id(pane_id);
+        let workspace = resolved.and_then(|(_, window_id, _)| {
+            self.get_window(window_id)
+                .map(|window| window.get_workspace().to_string())
+        });
+        self.session_recorder.start_session(SessionMetadata {
+            pane_id,
+            tab_id: resolved.map(|(_, _, tab_id)| tab_id),
+            window_id: resolved.map(|(_, window_id, _)| window_id),
+            workspace,
+            title_at_start: Some(pane.get_title()),
+            cwd_at_start: pane
+                .get_current_working_dir(CachePolicy::AllowStale)
+                .map(|url| url.to_string()),
+        });
         if let Some(reader) = pane.reader()? {
             let banner = self.banner.read().clone();
             let pane = Arc::downgrade(pane);
@@ -814,6 +848,7 @@ impl Mux {
         let mut changed = false;
         if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
             log::debug!("killing pane {}", pane_id);
+            self.session_recorder.end_session(pane_id, "pane_removed");
             pane.kill();
             self.notify(MuxNotification::PaneRemoved(pane_id));
             changed = true;

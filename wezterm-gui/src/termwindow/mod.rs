@@ -51,7 +51,7 @@ use mux::tab::{
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
-use smol::channel::Sender;
+use smol::channel::{bounded, Sender};
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
@@ -2324,6 +2324,118 @@ impl TermWindow {
         promise::spawn::spawn(future).detach();
     }
 
+    fn pane_lines_as_text(&self, pane: &Arc<dyn Pane>, nlines: usize) -> String {
+        let dims = pane.get_dimensions();
+        let bottom_row = dims.physical_top + dims.viewport_rows as isize;
+        let top_row = bottom_row.saturating_sub(nlines as isize);
+        let (_first_row, lines) = pane.get_lines(top_row..bottom_row);
+        let mut text = String::new();
+        for line in lines {
+            for cell in line.visible_cells() {
+                text.push_str(cell.str());
+            }
+            let trimmed = text.trim_end().len();
+            text.truncate(trimmed);
+            text.push('\n');
+        }
+        let trimmed = text.trim_end().len();
+        text.truncate(trimmed);
+        text
+    }
+
+    fn show_session_augmented_prompt(&mut self) {
+        let mux = Mux::get();
+        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+            Some(tab) => tab,
+            None => return,
+        };
+        let pane = match self.get_active_pane_or_overlay() {
+            Some(pane) => pane,
+            None => return,
+        };
+
+        let pane_id = pane.pane_id();
+        let (tx, rx) = bounded(1);
+        let description = "Enter the prompt to augment with current pane context".to_string();
+
+        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
+            crate::overlay::prompt::show_line_prompt_overlay_with_sender(
+                term,
+                description,
+                "> ".to_string(),
+                None,
+                tx,
+            )
+        });
+        self.assign_overlay(tab.tab_id(), overlay);
+        promise::spawn::spawn(future).detach();
+
+        let window = self.window.clone().unwrap();
+        promise::spawn::spawn(async move {
+            if let Ok(line) = rx.recv().await {
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.handle_session_augmented_prompt(pane_id, line);
+                })));
+            }
+        })
+        .detach();
+    }
+
+    fn handle_session_augmented_prompt(&mut self, pane_id: PaneId, line: Option<String>) {
+        let Some(original_input) = line else {
+            return;
+        };
+        let original_input = original_input.trim().to_string();
+        if original_input.is_empty() {
+            return;
+        }
+
+        let mux = Mux::get();
+        let Some(pane) = mux.get_pane(pane_id) else {
+            return;
+        };
+
+        let selection = self.selection_text(&pane);
+        let recent_output = self.pane_lines_as_text(&pane, 200);
+        let cwd = pane
+            .get_current_working_dir(CachePolicy::AllowStale)
+            .map(|url| url.to_string())
+            .unwrap_or_default();
+
+        let mut context_sections = vec![];
+        if !cwd.is_empty() {
+            context_sections.push(format!("Current working directory:\n{cwd}"));
+        }
+        if !selection.trim().is_empty() {
+            context_sections.push(format!("Selected text:\n{selection}"));
+        }
+        if !recent_output.trim().is_empty() {
+            context_sections.push(format!("Recent pane output:\n{recent_output}"));
+        }
+
+        let effective_input = if context_sections.is_empty() {
+            original_input.clone()
+        } else {
+            format!(
+                "{}\n\nContext:\n{}",
+                original_input,
+                context_sections.join("\n\n")
+            )
+        };
+
+        mux.record_session_text_event(pane_id, "input_original", &original_input);
+        if !context_sections.is_empty() {
+            mux.record_session_text_event(
+                pane_id,
+                "rag_context",
+                &context_sections.join("\n\n---\n\n"),
+            );
+        }
+        mux.record_session_text_event(pane_id, "input_effective", &effective_input);
+
+        let _ = pane.send_paste(&effective_input);
+    }
+
     fn show_confirmation(&mut self, args: &Confirmation) {
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
@@ -3151,6 +3263,9 @@ impl TermWindow {
                 pane.perform_actions(vec![termwiz::escape::Action::Esc(
                     termwiz::escape::Esc::Code(termwiz::escape::EscCode::FullReset),
                 )]);
+            }
+            PromptForSessionAugmentedInput => {
+                self.show_session_augmented_prompt();
             }
             OpenUri(link) => {
                 wezterm_open_url::open_url(link);
